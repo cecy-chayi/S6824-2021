@@ -23,7 +23,50 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskType int
 
+const (
+	MAP TaskType = iota
+	REDUCE
+	QUIT
+)
+
+type GetTaskArg struct {
+}
+
+type GetTaskReply struct {
+	Task          TaskType
+	TaskId        int
+	Filenames	  []string
+	NReduce       int
+	OK			  bool
+}
+
+type GetTaskErr struct {
+	TaskType    TaskType
+	TaskId      int
+	ErrorReason string
+}
+
+type FinishTaskArg struct {
+	Task        TaskType
+	TaskId      int
+	RetFilenames []string
+}
+
+type FinishTaskReply struct {
+	OK bool
+}
+
+func (er GetTaskErr) Error() string {
+	res := er.ErrorReason
+	if er.TaskType == MAP {
+		res = "MAP: " + strconv.Itoa(er.TaskId) + " " + res
+	} else if er.TaskType == REDUCE {
+		res = "REDUCE: " + strconv.Itoa(er.TaskId) + " " + res
+	}
+	return res
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
