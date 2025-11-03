@@ -62,15 +62,19 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	term int32
-	role Role
+	current_term int32
+	vote_for     int32
+	log          []LogEntry
+	role         Role
+	commit_index int32
+	last_applied int32
+
+	// for leader
+	next_index  []int32
+	match_index []int32
 
 	// follower
-	vote_for              int32
-	last_log_index        int32
-	last_log_term         int32
 	is_received_heartbeat int32
-	commit_index          int32
 	leader_id             int32
 	// 用于停止当前 leader election
 	stop_election_chan  chan struct{}
@@ -171,8 +175,6 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	fmt.Printf("[%d] RequestVote: %v\n", rf.me, args)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if rf.isFollower() {
 		// 收到 candidate 发来的 rpc，保持 follower状态
 		rf.setIsReceivedHeartbeat()
@@ -180,22 +182,44 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	term := rf.getTerm()
 	reply.TERM = max(term, args.TERM)
 	reply.VOTE_GRANTED = false
+	if args.TERM < term {
+		return
+	}
 	if args.TERM > term {
+		// 先更新 role 到 follower 再更新 term，确保 同一个 term 不出现两个 leader 的情况
+		rf.toFollower()
 		rf.setTerm(args.TERM)
-		rf.vote_for = args.CANDIDATE_ID
-		rf.setRole(RoleFollower)
-		reply.VOTE_GRANTED = true
-	} else if args.TERM == term && (rf.vote_for == -1 || rf.vote_for == args.CANDIDATE_ID) {
-		if args.LAST_LOG_TERM > rf.last_log_term || (args.LAST_LOG_TERM == rf.last_log_term && args.LAST_LOG_INDEX >= rf.last_log_index) {
+		rf.setVoteFor(-1)
+	}
+	// 这个锁是必要的，因为可能会同时收到多个 candidate 的 rpc，需要利用锁确保以下操作的原子性
+	rf.mu.Lock()
+	vote_for := rf.getVoteFor()
+	if vote_for == -1 || vote_for == args.CANDIDATE_ID {
+		last_log_entry := rf.getLastLogEntry()
+		if args.LAST_LOG_TERM > last_log_entry.TERM ||
+			(args.LAST_LOG_TERM == last_log_entry.TERM && args.LAST_LOG_INDEX >= last_log_entry.INDEX) {
+			rf.setVoteFor(args.CANDIDATE_ID)
 			reply.VOTE_GRANTED = true
 		}
 	}
+	rf.mu.Unlock()
 	fmt.Printf("[%d] RequestVote reply: %v\n", rf.me, reply)
+}
+
+func (rf *Raft) toFollower() {
+	if rf.isLeader() {
+		rf.stop_heartbeat_chan <- struct{}{}
+	}
+	if rf.isCandidate() {
+		rf.stop_election_chan <- struct{}{}
+	}
+	rf.setRole(RoleFollower)
 }
 
 type LogEntry struct {
 	TERM  int32
 	INDEX int32
+	CMD   interface{}
 }
 
 type AppendEntriesArgs struct {
@@ -208,23 +232,44 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	TERM    int32
-	SUCCESS bool
+	TERM     int32
+	SEVER_ID int32
+	SUCCESS  bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	fmt.Printf("[%d] AppendEntries: %v\n", rf.me, args)
 	rf.setIsReceivedHeartbeat()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term := rf.getTerm()
 	reply.TERM = max(term, args.TERM)
+	reply.SEVER_ID = int32(rf.me)
 	reply.SUCCESS = false
-	if args.TERM > term {
-		rf.setTerm(args.TERM)
-		rf.setRole(RoleFollower)
-		rf.leader_id = args.LEADER_ID
-		reply.SUCCESS = true
+	if args.TERM < term || !rf.consitencyCheck(args) {
+		fmt.Printf("[%d] reject AppendEntries because of inconsitency: %v\n", rf.me, args)
+		return
 	}
+	if !rf.isFollower() {
+		rf.toFollower()
+	}
+	rf.setTerm(args.TERM)
+	rf.leader_id = args.LEADER_ID
+	rf.appendLogEntry(args.PREV_LOG_INDEX, args.ENTRIES...)
+
+}
+
+func (rf *Raft) consitencyCheck(args *AppendEntriesArgs) bool {
+	// follower 掉线，新 leader 不清楚该 follower 情况会出现
+	// prev_log_index 大于 follower 日志长度的情况
+	if args.PREV_LOG_INDEX > rf.getLogLen() {
+		return false
+	}
+	prev_log_entry := rf.getLogEntry(args.PREV_LOG_INDEX)
+	if args.PREV_LOG_TERM != prev_log_entry.TERM || args.PREV_LOG_INDEX != prev_log_entry.INDEX {
+		return false
+	}
+	return true
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -359,19 +404,55 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.setRole(RoleFollower)
-	rf.vote_for = -1
+	rf.setVoteFor(-1)
 	rf.setTerm(0)
-	rf.last_log_index = 0
-	rf.last_log_term = 0
+	// raft 的 index 是 1-index
+	rf.log = make([]LogEntry, 1)
 	rf.resetIsReceivedHeartbeat()
 	rf.stop_election_chan = make(chan struct{})
+	rf.stop_heartbeat_chan = make(chan struct{})
+	rf.next_index = make([]int32, len(rf.peers))
+	rf.match_index = make([]int32, len(rf.peers))
+	for i := range rf.peers {
+		rf.next_index[i] = 1
+		rf.match_index[i] = 0
+	}
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.StatePrint()
 
 	return rf
+}
+
+func (rf *Raft) StatePrint() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.isLeader() {
+			fmt.Printf("[%d] role: %v, term: %d, leader_id: %d, vote_for: %d, next_index: %v, match_index: %v, log: %v\n",
+				rf.me, int2Role(rf.getRole()), rf.getTerm(), rf.leader_id, rf.getVoteFor(), rf.next_index, rf.match_index, rf.log)
+		} else {
+			fmt.Printf("[%d] role: %v, term: %d, leader_id: %d, vote_for: %d, log: %v\n",
+				rf.me, int2Role(rf.getRole()), rf.getTerm(), rf.leader_id, rf.getVoteFor(), rf.log)
+		}
+		rf.mu.Unlock()
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func int2Role(role int32) string {
+	switch role {
+	case int32(RoleFollower):
+		return "RoleFollower"
+	case int32(RoleCandidate):
+		return "RoleCandidate"
+	case int32(RoleLeader):
+		return "RoleLeader"
+	default:
+		return "RoleFollower"
+	}
 }
 
 func (rf *Raft) getRole() Role {
@@ -418,12 +499,13 @@ func (rf *Raft) leaderElection() {
 	default:
 	}
 	term := rf.AddTerm(1)
-	rf.vote_for = int32(rf.me)
+	rf.setVoteFor(int32(rf.me))
+	last_log_entry := rf.getLastLogEntry()
 	args := &RequestVoteArgs{
 		TERM:           term,
 		CANDIDATE_ID:   int32(rf.me),
-		LAST_LOG_TERM:  rf.last_log_term,
-		LAST_LOG_INDEX: rf.last_log_index,
+		LAST_LOG_TERM:  last_log_entry.TERM,
+		LAST_LOG_INDEX: last_log_entry.INDEX,
 	}
 	reply_chan := make(chan RequestVoteReply)
 	all_servers := len(rf.peers)
@@ -435,8 +517,8 @@ func (rf *Raft) leaderElection() {
 		if peer == rf.me {
 			continue
 		}
-		reply := &RequestVoteReply{}
 		go func(peer int) {
+			reply := &RequestVoteReply{}
 			rf.sendRequestVote(peer, args, reply)
 			reply_chan <- *reply
 		}(peer)
@@ -457,71 +539,136 @@ func (rf *Raft) leaderElection() {
 			}
 		}
 	}
-	rf.setRole(RoleLeader)
 	fmt.Printf("server %d now is leader\n", rf.me)
+	rf.setRole(RoleLeader)
+	rf.mu.Lock()
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		rf.match_index[peer] = 0
+		rf.next_index[peer] = rf.getLastLogEntry().INDEX + 1
+	}
+	rf.mu.Unlock()
+
 	go rf.sendHeartbeats()
 }
 
 func (rf *Raft) sendHeartbeats() {
+	// 清空 stop_heartbeat_chan
+	select {
+	case <-rf.stop_heartbeat_chan:
+	default:
+	}
 	for !rf.killed() {
+		rf.setIsReceivedHeartbeat()
 		select {
-		case <-rf.stop_election_chan:
+		case <-rf.stop_heartbeat_chan:
 			return
 		default:
 			rf.mu.Lock()
 			all_servers := len(rf.peers)
-			args := &AppendEntriesArgs{
-				TERM:           rf.getTerm(),
-				LEADER_ID:      int32(rf.me),
-				PREV_LOG_INDEX: rf.last_log_index,
-				PREV_LOG_TERM:  rf.last_log_term,
-				ENTRIES:        []LogEntry{},
-				LEADER_COMMIT:  rf.commit_index,
+			args := make([]*AppendEntriesArgs, all_servers)
+			for peer := 0; peer < all_servers; peer++ {
+				prev_log_entry := rf.getLogEntry(rf.match_index[peer])
+				args[peer] = &AppendEntriesArgs{
+					TERM:           rf.getTerm(),
+					LEADER_ID:      int32(rf.me),
+					PREV_LOG_INDEX: prev_log_entry.INDEX,
+					PREV_LOG_TERM:  prev_log_entry.TERM,
+					ENTRIES:        rf.log[rf.next_index[peer]:],
+					LEADER_COMMIT:  rf.commit_index,
+				}
 			}
 			rf.mu.Unlock()
 
 			replyCh := make(chan AppendEntriesReply)
+			// 100ms 后停止接收 reply
+			stop_sign := int32(0)
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				atomic.StoreInt32(&stop_sign, 1)
+			}()
 			for peer := 0; peer < all_servers; peer++ {
 				if peer == rf.me {
 					continue
 				}
-				reply := &AppendEntriesReply{}
 				go func(peer int) {
-					rf.sendAppendEntries(peer, args, reply)
-					replyCh <- *reply
+					reply := &AppendEntriesReply{}
+					rf.sendAppendEntries(peer, args[peer], reply)
+					if atomic.LoadInt32(&stop_sign) == 0 {
+						replyCh <- *reply
+					}
 				}(peer)
 			}
 
 			reply_counts := 0
-			for reply_counts < all_servers-1 {
+			for atomic.LoadInt32(&stop_sign) == 0 && reply_counts < all_servers-1 {
 				select {
 				case reply := <-replyCh:
 					reply_counts += 1
 					if reply.TERM > rf.getTerm() {
-						rf.setRole(RoleFollower)
-						rf.setIsReceivedHeartbeat()
+						// 先更新 role 到 follower 再更新 term，确保 同一个 term 不出现两个 leader 的情况
+						rf.toFollower()
 						rf.setTerm(reply.TERM)
 						return
+					}
+					server := reply.SEVER_ID
+					if reply.SUCCESS {
+						if len(args[server].ENTRIES) > 0 {
+							rf.mu.Lock()
+							rf.match_index[server] = args[server].ENTRIES[len(args[server].ENTRIES)-1].INDEX
+							rf.next_index[server] = rf.match_index[server] + 1
+							rf.mu.Unlock()
+						}
+					} else {
+						rf.mu.Lock()
+						rf.next_index[server] = max(rf.next_index[server]-1, 1)
+						rf.mu.Unlock()
 					}
 				case <-rf.stop_heartbeat_chan:
 					return
 				}
 			}
-			time.Sleep(10 * time.Millisecond)
+			close(replyCh)
 		}
 	}
 }
 
 func (rf *Raft) setTerm(term int32) {
-	atomic.StoreInt32(&rf.term, term)
+	atomic.StoreInt32(&rf.current_term, term)
 }
 
 func (rf *Raft) getTerm() int32 {
-	return atomic.LoadInt32(&rf.term)
+	return atomic.LoadInt32(&rf.current_term)
+}
+
+func (rf *Raft) getLastLogEntry() LogEntry {
+	return rf.log[len(rf.log)-1]
+}
+
+func (rf *Raft) getLogEntry(index int32) LogEntry {
+	return rf.log[index]
+}
+
+func (rf *Raft) getLogLen() int32 {
+	return int32(len(rf.log) - 1)
+}
+
+func (rf *Raft) appendLogEntry(prev_log_index int32, entries ...LogEntry) {
+	rf.log = append(rf.log[:prev_log_index+1], entries...)
 }
 
 func (rf *Raft) AddTerm(v int32) int32 {
-	return atomic.AddInt32(&rf.term, v)
+	return atomic.AddInt32(&rf.current_term, v)
+}
+
+func (rf *Raft) getVoteFor() int32 {
+	return atomic.LoadInt32(&rf.vote_for)
+}
+
+func (rf *Raft) setVoteFor(vote_for int32) {
+	atomic.StoreInt32(&rf.vote_for, vote_for)
 }
 
 func max(a, b int32) int32 {
