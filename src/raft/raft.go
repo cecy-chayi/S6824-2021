@@ -22,6 +22,7 @@ import (
 
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,7 @@ type Raft struct {
 	role         Role
 	commit_index int32
 	last_applied int32
+	applyCh      chan ApplyMsg
 
 	// for leader
 	next_index  []int32
@@ -77,8 +79,9 @@ type Raft struct {
 	is_received_heartbeat int32
 	leader_id             int32
 	// 用于停止当前 leader election
-	stop_election_chan  chan struct{}
-	stop_heartbeat_chan chan struct{}
+	stop_election_chan            chan struct{}
+	stop_heartbeat_chan           chan struct{}
+	stop_commit_index_update_chan chan struct{}
 }
 
 type Role = int32
@@ -175,10 +178,6 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	fmt.Printf("[%d] RequestVote: %v\n", rf.me, args)
-	if rf.isFollower() {
-		// 收到 candidate 发来的 rpc，保持 follower状态
-		rf.setIsReceivedHeartbeat()
-	}
 	term := rf.getTerm()
 	reply.TERM = max(term, args.TERM)
 	reply.VOTE_GRANTED = false
@@ -187,12 +186,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if args.TERM > term {
 		// 先更新 role 到 follower 再更新 term，确保 同一个 term 不出现两个 leader 的情况
+		fmt.Printf("[%d] become follower because of received higher term: %v\n", rf.me, args)
 		rf.toFollower()
 		rf.setTerm(args.TERM)
 		rf.setVoteFor(-1)
 	}
 	// 这个锁是必要的，因为可能会同时收到多个 candidate 的 rpc，需要利用锁确保以下操作的原子性
-	rf.mu.Lock()
+	rf.Lock()
+	defer rf.Unlock()
 	vote_for := rf.getVoteFor()
 	if vote_for == -1 || vote_for == args.CANDIDATE_ID {
 		last_log_entry := rf.getLastLogEntry()
@@ -200,26 +201,47 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			(args.LAST_LOG_TERM == last_log_entry.TERM && args.LAST_LOG_INDEX >= last_log_entry.INDEX) {
 			rf.setVoteFor(args.CANDIDATE_ID)
 			reply.VOTE_GRANTED = true
+			// 当认可 candidate 的 vote 时，才设置心跳
+			// 否则会出现某个 server 一直拒绝 request vote 但是无法当上 leader 的情况
+			if rf.isFollower() {
+				// 收到 candidate 发来的 rpc，保持 follower状态
+				rf.setIsReceivedHeartbeat()
+			}
 		}
 	}
-	rf.mu.Unlock()
 	fmt.Printf("[%d] RequestVote reply: %v\n", rf.me, reply)
 }
 
 func (rf *Raft) toFollower() {
+	fmt.Printf("[%d] toFollower, now is %v\n", rf.me, int2Role(rf.getRole()))
 	if rf.isLeader() {
-		rf.stop_heartbeat_chan <- struct{}{}
+		// 无阻塞发送 stop signal
+		select {
+		case rf.stop_heartbeat_chan <- struct{}{}:
+			fmt.Printf("[%d] stop heartbeat signal sent successfully\n", rf.me)
+		default:
+		}
+		select {
+		case rf.stop_commit_index_update_chan <- struct{}{}:
+			fmt.Printf("[%d] stop commit index update signal sent successfully\n", rf.me)
+		default:
+		}
 	}
 	if rf.isCandidate() {
-		rf.stop_election_chan <- struct{}{}
+		// 无阻塞发送 stop signal
+		select {
+		case rf.stop_election_chan <- struct{}{}:
+			fmt.Printf("[%d] stop election signal sent successfully\n", rf.me)
+		default:
+		}
 	}
 	rf.setRole(RoleFollower)
 }
 
 type LogEntry struct {
-	TERM  int32
-	INDEX int32
-	CMD   interface{}
+	TERM    int32
+	INDEX   int32
+	COMMAND interface{}
 }
 
 type AppendEntriesArgs struct {
@@ -238,10 +260,10 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	fmt.Printf("[%d] AppendEntries: %v\n", rf.me, args)
+	fmt.Printf("[%s] [%d] AppendEntries: %v\n", time.Now().Format("15:04:05.000"), rf.me, args)
 	rf.setIsReceivedHeartbeat()
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.Lock()
+	defer rf.Unlock()
 	term := rf.getTerm()
 	reply.TERM = max(term, args.TERM)
 	reply.SEVER_ID = int32(rf.me)
@@ -250,13 +272,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		fmt.Printf("[%d] reject AppendEntries because of inconsitency: %v\n", rf.me, args)
 		return
 	}
+	reply.SUCCESS = true
 	if !rf.isFollower() {
+		fmt.Printf("[%d] become follower because of received higher term: %v\n", rf.me, args)
 		rf.toFollower()
 	}
 	rf.setTerm(args.TERM)
 	rf.leader_id = args.LEADER_ID
+	rf.setCommitIndex(min(args.LEADER_COMMIT, int32(rf.getLogLen())))
 	rf.appendLogEntry(args.PREV_LOG_INDEX, args.ENTRIES...)
-
+	fmt.Printf("[%d] AppendEntries reply: %v\n", rf.me, reply)
 }
 
 func (rf *Raft) consitencyCheck(args *AppendEntriesArgs) bool {
@@ -328,13 +353,22 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.Lock()
+	defer rf.Unlock()
+	term, isLeader := rf.GetState()
+	if !isLeader {
+		return int(rf.getLogLen()) + 1, term, isLeader
+	}
+	fmt.Printf("[%d] Start: %v\n", rf.me, command)
+	index := rf.getLogLen() + 1
+	rf.appendLogEntry(index-1, LogEntry{
+		TERM:    int32(term),
+		INDEX:   index,
+		COMMAND: command,
+	})
 
-	return index, term, isLeader
+	return int(index), term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -401,6 +435,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
+	rf.commit_index = 0
+	rf.last_applied = 0
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.setRole(RoleFollower)
@@ -409,8 +446,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// raft 的 index 是 1-index
 	rf.log = make([]LogEntry, 1)
 	rf.resetIsReceivedHeartbeat()
-	rf.stop_election_chan = make(chan struct{})
-	rf.stop_heartbeat_chan = make(chan struct{})
+	rf.stop_election_chan = make(chan struct{}, 1)
+	rf.stop_heartbeat_chan = make(chan struct{}, 1)
+	rf.stop_commit_index_update_chan = make(chan struct{}, 1)
 	rf.next_index = make([]int32, len(rf.peers))
 	rf.match_index = make([]int32, len(rf.peers))
 	for i := range rf.peers {
@@ -423,22 +461,40 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.StatePrint()
+	go rf.applyLog()
 
 	return rf
 }
 
+func (rf *Raft) applyLog() {
+	for !rf.killed() {
+		time.Sleep(10 * time.Millisecond)
+		if rf.getCommitIndex() > rf.getLastApplied() {
+			rf.Lock()
+			fmt.Printf("[%d] apply log: %v\n", rf.me, rf.log[rf.last_applied+1])
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.last_applied+1].COMMAND,
+				CommandIndex: int(rf.log[rf.last_applied+1].INDEX),
+			}
+			rf.AddLastApplied(1)
+			rf.Unlock()
+		}
+	}
+}
+
 func (rf *Raft) StatePrint() {
 	for !rf.killed() {
-		rf.mu.Lock()
+		rf.Lock()
 		if rf.isLeader() {
-			fmt.Printf("[%d] role: %v, term: %d, leader_id: %d, vote_for: %d, next_index: %v, match_index: %v, log: %v\n",
-				rf.me, int2Role(rf.getRole()), rf.getTerm(), rf.leader_id, rf.getVoteFor(), rf.next_index, rf.match_index, rf.log)
+			fmt.Printf("[%d] role: %v, term: %d, leader_id: %d, commit_index: %d, vote_for: %d, next_index: %v, match_index: %v, log: %v\n",
+				rf.me, int2Role(rf.getRole()), rf.getTerm(), rf.leader_id, rf.commit_index, rf.getVoteFor(), rf.next_index, rf.match_index, rf.log)
 		} else {
-			fmt.Printf("[%d] role: %v, term: %d, leader_id: %d, vote_for: %d, log: %v\n",
-				rf.me, int2Role(rf.getRole()), rf.getTerm(), rf.leader_id, rf.getVoteFor(), rf.log)
+			fmt.Printf("[%d] role: %v, term: %d, leader_id: %d, commit_index: %d, vote_for: %d, log: %v\n",
+				rf.me, int2Role(rf.getRole()), rf.getTerm(), rf.leader_id, rf.commit_index, rf.getVoteFor(), rf.log)
 		}
-		rf.mu.Unlock()
-		time.Sleep(300 * time.Millisecond)
+		rf.Unlock()
+		time.Sleep(150 * time.Millisecond)
 	}
 }
 
@@ -492,7 +548,9 @@ func (rf *Raft) isReceivedHeartbeat() bool {
 }
 
 func (rf *Raft) leaderElection() {
-	rf.mu.Lock()
+	fmt.Printf("[%d] start leader election\n", rf.me)
+	defer fmt.Printf("[%d] stop leader election\n", rf.me)
+	rf.Lock()
 	// 清空 stop_election_chan
 	select {
 	case <-rf.stop_election_chan:
@@ -512,7 +570,7 @@ func (rf *Raft) leaderElection() {
 	majority := (all_servers + 1) / 2
 	vote_counts := 1
 
-	rf.mu.Unlock()
+	rf.Unlock()
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
@@ -540,8 +598,12 @@ func (rf *Raft) leaderElection() {
 		}
 	}
 	fmt.Printf("server %d now is leader\n", rf.me)
+	rf.toLeader()
+}
+
+func (rf *Raft) toLeader() {
 	rf.setRole(RoleLeader)
-	rf.mu.Lock()
+	rf.Lock()
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
@@ -549,9 +611,42 @@ func (rf *Raft) leaderElection() {
 		rf.match_index[peer] = 0
 		rf.next_index[peer] = rf.getLastLogEntry().INDEX + 1
 	}
-	rf.mu.Unlock()
+	rf.Unlock()
 
 	go rf.sendHeartbeats()
+	go rf.updateCommitIndex()
+}
+
+func (rf *Raft) updateCommitIndex() {
+	fmt.Printf("[%d] start updateCommitIndex\n", rf.me)
+	defer fmt.Printf("[%d] stop updateCommitIndex\n", rf.me)
+	for !rf.killed() {
+		time.Sleep(30 * time.Millisecond)
+		select {
+		case <-rf.stop_commit_index_update_chan:
+			return
+		default:
+			rf.Lock()
+			num_peers := len(rf.match_index) - 1
+			match_index := make([]int32, 0, num_peers)
+			for peer, index := range rf.match_index {
+				if peer == rf.me {
+					continue
+				}
+				match_index = append(match_index, index)
+			}
+			sort.Slice(match_index, func(i, j int) bool {
+				return match_index[i] < match_index[j]
+			})
+			follower_match_index := int32(match_index[len(match_index)/2])
+			if follower_match_index > rf.getCommitIndex() &&
+				rf.getLogEntry(follower_match_index).TERM == rf.getTerm() {
+				fmt.Printf("[%d] update commit index to %d\n", rf.me, follower_match_index)
+				rf.setCommitIndex(follower_match_index)
+			}
+			rf.Unlock()
+		}
+	}
 }
 
 func (rf *Raft) sendHeartbeats() {
@@ -560,78 +655,101 @@ func (rf *Raft) sendHeartbeats() {
 	case <-rf.stop_heartbeat_chan:
 	default:
 	}
+	fmt.Printf("[%d] start sendHeartbeats\n", rf.me)
+	defer fmt.Printf("[%d] stop sendHeartbeats\n", rf.me)
 	for !rf.killed() {
-		rf.setIsReceivedHeartbeat()
 		select {
 		case <-rf.stop_heartbeat_chan:
 			return
 		default:
-			rf.mu.Lock()
+			rf.Lock()
 			all_servers := len(rf.peers)
 			args := make([]*AppendEntriesArgs, all_servers)
 			for peer := 0; peer < all_servers; peer++ {
-				prev_log_entry := rf.getLogEntry(rf.match_index[peer])
+				prev_log_entry := rf.getLogEntry(rf.next_index[peer] - 1)
+				entriesCopy := make([]LogEntry, len(rf.log[rf.next_index[peer]:]))
+				for i, entry := range rf.log[rf.next_index[peer]:] {
+					entriesCopy[i] = LogEntry{
+						TERM:  entry.TERM,
+						INDEX: entry.INDEX,
+						// entry.COMMAND 若进行深拷贝，需要更加复杂的设计
+						COMMAND: entry.COMMAND,
+					}
+				}
 				args[peer] = &AppendEntriesArgs{
 					TERM:           rf.getTerm(),
 					LEADER_ID:      int32(rf.me),
 					PREV_LOG_INDEX: prev_log_entry.INDEX,
 					PREV_LOG_TERM:  prev_log_entry.TERM,
-					ENTRIES:        rf.log[rf.next_index[peer]:],
-					LEADER_COMMIT:  rf.commit_index,
+					ENTRIES:        entriesCopy,
+					LEADER_COMMIT:  rf.getCommitIndex(),
 				}
 			}
-			rf.mu.Unlock()
+			rf.Unlock()
 
-			replyCh := make(chan AppendEntriesReply)
-			// 100ms 后停止接收 reply
+			var wg sync.WaitGroup
+			reply_ch := make(chan AppendEntriesReply, all_servers-1)
+			close_reply_ch := func() {
+				wg.Wait()
+				close(reply_ch)
+			}
+
+			// 50ms 后停止接收 reply
 			stop_sign := int32(0)
 			go func() {
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(50 * time.Millisecond)
 				atomic.StoreInt32(&stop_sign, 1)
 			}()
 			for peer := 0; peer < all_servers; peer++ {
 				if peer == rf.me {
 					continue
 				}
+				wg.Add(1)
 				go func(peer int) {
+					defer wg.Done()
 					reply := &AppendEntriesReply{}
 					rf.sendAppendEntries(peer, args[peer], reply)
-					if atomic.LoadInt32(&stop_sign) == 0 {
-						replyCh <- *reply
-					}
+					reply_ch <- *reply
 				}(peer)
 			}
 
 			reply_counts := 0
 			for atomic.LoadInt32(&stop_sign) == 0 && reply_counts < all_servers-1 {
+				time.Sleep(10 * time.Millisecond)
 				select {
-				case reply := <-replyCh:
+				case reply := <-reply_ch:
 					reply_counts += 1
 					if reply.TERM > rf.getTerm() {
 						// 先更新 role 到 follower 再更新 term，确保 同一个 term 不出现两个 leader 的情况
 						rf.toFollower()
 						rf.setTerm(reply.TERM)
+						go close_reply_ch()
 						return
 					}
 					server := reply.SEVER_ID
 					if reply.SUCCESS {
 						if len(args[server].ENTRIES) > 0 {
-							rf.mu.Lock()
+							rf.Lock()
 							rf.match_index[server] = args[server].ENTRIES[len(args[server].ENTRIES)-1].INDEX
 							rf.next_index[server] = rf.match_index[server] + 1
-							rf.mu.Unlock()
+							rf.Unlock()
 						}
 					} else {
-						rf.mu.Lock()
-						rf.next_index[server] = max(rf.next_index[server]-1, 1)
-						rf.mu.Unlock()
+						rf.Lock()
+						for rf.next_index[server] > 1 && rf.getLogEntry(rf.next_index[server]-1).TERM != reply.TERM {
+							rf.next_index[server] -= 1
+						}
+						rf.Unlock()
 					}
 				case <-rf.stop_heartbeat_chan:
+					go close_reply_ch()
 					return
+				default:
 				}
 			}
-			close(replyCh)
+			go close_reply_ch()
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -671,9 +789,48 @@ func (rf *Raft) setVoteFor(vote_for int32) {
 	atomic.StoreInt32(&rf.vote_for, vote_for)
 }
 
+func (rf *Raft) getCommitIndex() int32 {
+	return atomic.LoadInt32(&rf.commit_index)
+}
+
+func (rf *Raft) setCommitIndex(commit_index int32) {
+	atomic.StoreInt32(&rf.commit_index, commit_index)
+}
+
+func (rf *Raft) getLastApplied() int32 {
+	return atomic.LoadInt32(&rf.last_applied)
+}
+
+func (rf *Raft) AddLastApplied(x int32) {
+	atomic.AddInt32(&rf.last_applied, x)
+}
+
 func max(a, b int32) int32 {
 	if a > b {
 		return a
 	}
 	return b
+}
+
+func min(a, b int32) int32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (rf *Raft) Lock() {
+	// _, file, line, ok := runtime.Caller(1)
+	// if ok {
+	// 	fmt.Printf("[%d] Lock at %s:%d\n", rf.me, file, line)
+	// }
+	rf.mu.Lock()
+}
+
+func (rf *Raft) Unlock() {
+	// _, file, line, ok := runtime.Caller(1)
+	// if ok {
+	// 	fmt.Printf("[%d] Unlock at %s:%d\n", rf.me, file, line)
+	// }
+	rf.mu.Unlock()
 }
