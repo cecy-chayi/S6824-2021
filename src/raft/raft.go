@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -116,11 +118,28 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	// currentTerm
+	e.Encode(rf.getTerm())
+	// votedFpr
+	e.Encode(rf.getVoteFor())
+	// log
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		rf.setVoteFor(-1)
+		rf.setTerm(0)
+		// raft 的 index 是 1-index
+		rf.log = make([]LogEntry, 1)
 		return
 	}
 	// Your code here (2C).
@@ -136,6 +155,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int32
+	var vote_for int32
+	var log []LogEntry
+	if d.Decode(&term) != nil ||
+		d.Decode(&vote_for) != nil ||
+		d.Decode(&log) != nil {
+		fmt.Printf("readPersist error: %v\n", d)
+	} else {
+		rf.setTerm(term)
+		rf.setVoteFor(vote_for)
+		rf.log = log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -190,6 +223,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.toFollower()
 		rf.setTerm(args.TERM)
 		rf.setVoteFor(-1)
+		rf.Lock()
+		rf.persist()
+		rf.Unlock()
 	}
 	// 这个锁是必要的，因为可能会同时收到多个 candidate 的 rpc，需要利用锁确保以下操作的原子性
 	rf.Lock()
@@ -200,6 +236,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if args.LAST_LOG_TERM > last_log_entry.TERM ||
 			(args.LAST_LOG_TERM == last_log_entry.TERM && args.LAST_LOG_INDEX >= last_log_entry.INDEX) {
 			rf.setVoteFor(args.CANDIDATE_ID)
+			rf.persist()
 			reply.VOTE_GRANTED = true
 			// 当认可 candidate 的 vote 时，才设置心跳
 			// 否则会出现某个 server 一直拒绝 request vote 但是无法当上 leader 的情况
@@ -281,6 +318,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.leader_id = args.LEADER_ID
 	rf.setCommitIndex(min(args.LEADER_COMMIT, int32(rf.getLogLen())))
 	rf.appendLogEntry(args.PREV_LOG_INDEX, args.ENTRIES...)
+	rf.persist()
 	fmt.Printf("[%d] AppendEntries reply: %v\n", rf.me, reply)
 }
 
@@ -367,7 +405,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		INDEX:   index,
 		COMMAND: command,
 	})
-
+	rf.persist()
 	return int(index), term, isLeader
 }
 
@@ -441,10 +479,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.setRole(RoleFollower)
-	rf.setVoteFor(-1)
-	rf.setTerm(0)
-	// raft 的 index 是 1-index
-	rf.log = make([]LogEntry, 1)
 	rf.resetIsReceivedHeartbeat()
 	rf.stop_election_chan = make(chan struct{}, 1)
 	rf.stop_heartbeat_chan = make(chan struct{}, 1)
@@ -460,7 +494,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.StatePrint()
+	// go rf.StatePrint()
 	go rf.applyLog()
 
 	return rf
@@ -558,6 +592,7 @@ func (rf *Raft) leaderElection() {
 	}
 	term := rf.AddTerm(1)
 	rf.setVoteFor(int32(rf.me))
+	rf.persist()
 	last_log_entry := rf.getLastLogEntry()
 	args := &RequestVoteArgs{
 		TERM:           term,
@@ -590,9 +625,12 @@ func (rf *Raft) leaderElection() {
 			if reply.VOTE_GRANTED {
 				vote_counts += 1
 			} else if reply.TERM > term {
+				rf.Lock()
 				rf.setRole(RoleFollower)
 				rf.setIsReceivedHeartbeat()
 				rf.setTerm(reply.TERM)
+				rf.persist()
+				rf.Unlock()
 				return
 			}
 		}
@@ -721,8 +759,12 @@ func (rf *Raft) sendHeartbeats() {
 					reply_counts += 1
 					if reply.TERM > rf.getTerm() {
 						// 先更新 role 到 follower 再更新 term，确保 同一个 term 不出现两个 leader 的情况
+						// persist 需要 Lock
+						rf.Lock()
 						rf.toFollower()
 						rf.setTerm(reply.TERM)
+						rf.persist()
+						rf.Unlock()
 						go close_reply_ch()
 						return
 					}

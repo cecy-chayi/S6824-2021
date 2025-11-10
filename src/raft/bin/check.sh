@@ -2,7 +2,7 @@
 
 while true; do
     # 运行测试并将输出保存到文件
-    go test -run 2B -race > txt.log 2>&1
+    go test -run 2C -race > txt.log 2>&1
     
     # 检查输出中是否包含 FAIL
     if grep -q "FAIL" txt.log; then
