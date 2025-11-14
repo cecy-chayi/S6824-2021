@@ -65,13 +65,14 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	current_term int32
-	vote_for     int32
-	log          []LogEntry
-	role         Role
-	commit_index int32
-	last_applied int32
-	applyCh      chan ApplyMsg
+	current_term  int32
+	vote_for      int32
+	log           []LogEntry
+	role          Role
+	commit_index  int32
+	last_applied  int32
+	applyCh       chan ApplyMsg
+	log_entry_len int32
 
 	// for leader
 	next_index  []int32
@@ -128,6 +129,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.getVoteFor())
 	// log
 	e.Encode(rf.log)
+	e.Encode(rf.log_entry_len)
 
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -140,6 +142,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.setTerm(0)
 		// raft 的 index 是 1-index
 		rf.log = make([]LogEntry, 1)
+		rf.log_entry_len = 0
 		return
 	}
 	// Your code here (2C).
@@ -160,14 +163,17 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int32
 	var vote_for int32
 	var log []LogEntry
+	var log_entry_len int32
 	if d.Decode(&term) != nil ||
 		d.Decode(&vote_for) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&log_entry_len) != nil {
 		fmt.Printf("readPersist error: %v\n", d)
 	} else {
 		rf.setTerm(term)
 		rf.setVoteFor(vote_for)
 		rf.log = log
+		rf.log_entry_len = log_entry_len
 	}
 }
 
@@ -395,17 +401,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Lock()
 	defer rf.Unlock()
 	term, isLeader := rf.GetState()
+	last_log_entry_index := int(rf.getLastLogEntry().INDEX)
 	if !isLeader {
-		return int(rf.getLogLen()) + 1, term, isLeader
+		return last_log_entry_index + 1, term, isLeader
 	}
 	fmt.Printf("[%d] Start: %v\n", rf.me, command)
-	index := rf.getLogLen() + 1
-	rf.appendLogEntry(index-1, LogEntry{
+
+	index := int32(last_log_entry_index + 1)
+	rf.appendLogEntry(int32(last_log_entry_index), LogEntry{
 		TERM:    int32(term),
 		INDEX:   index,
 		COMMAND: command,
 	})
 	rf.persist()
+	fmt.Printf("[%d] Start: %v, index: %d\n", rf.me, command, index)
 	return int(index), term, isLeader
 }
 
@@ -505,11 +514,12 @@ func (rf *Raft) applyLog() {
 		time.Sleep(10 * time.Millisecond)
 		if rf.getCommitIndex() > rf.getLastApplied() {
 			rf.Lock()
-			fmt.Printf("[%d] apply log: %v\n", rf.me, rf.log[rf.last_applied+1])
+			apply_log := rf.getLogEntry(int32(rf.last_applied + 1))
+			fmt.Printf("[%d] apply log: %v\n", rf.me, apply_log)
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[rf.last_applied+1].COMMAND,
-				CommandIndex: int(rf.log[rf.last_applied+1].INDEX),
+				Command:      apply_log.COMMAND,
+				CommandIndex: int(apply_log.INDEX),
 			}
 			rf.AddLastApplied(1)
 			rf.Unlock()
@@ -617,7 +627,7 @@ func (rf *Raft) leaderElection() {
 		}(peer)
 	}
 
-	for vote_counts < majority {
+	for !rf.killed() && vote_counts < majority {
 		select {
 		case <-rf.stop_election_chan:
 			return
@@ -705,14 +715,15 @@ func (rf *Raft) sendHeartbeats() {
 			args := make([]*AppendEntriesArgs, all_servers)
 			for peer := 0; peer < all_servers; peer++ {
 				prev_log_entry := rf.getLogEntry(rf.next_index[peer] - 1)
-				entriesCopy := make([]LogEntry, len(rf.log[rf.next_index[peer]:]))
-				for i, entry := range rf.log[rf.next_index[peer]:] {
-					entriesCopy[i] = LogEntry{
+				prev_local_index := rf.getLogEntryLocalIndex(prev_log_entry.INDEX)
+				entriesCopy := make([]LogEntry, 0)
+				for _, entry := range rf.log[prev_local_index+1:] {
+					entriesCopy = append(entriesCopy, LogEntry{
 						TERM:  entry.TERM,
 						INDEX: entry.INDEX,
 						// entry.COMMAND 若进行深拷贝，需要更加复杂的设计
 						COMMAND: entry.COMMAND,
-					}
+					})
 				}
 				args[peer] = &AppendEntriesArgs{
 					TERM:           rf.getTerm(),
@@ -804,19 +815,45 @@ func (rf *Raft) getTerm() int32 {
 }
 
 func (rf *Raft) getLastLogEntry() LogEntry {
-	return rf.log[len(rf.log)-1]
+	return rf.log[int(rf.getLogLen())]
 }
 
 func (rf *Raft) getLogEntry(index int32) LogEntry {
-	return rf.log[index]
+	len := int(rf.getLogLen())
+	for i := 1; i <= len; i++ {
+		if rf.log[i].INDEX == index {
+			return rf.log[i]
+		}
+	}
+	// 未找到对应 index 的 log entry，返回空 log entry
+	return LogEntry{}
+}
+
+// local index 指使用 index 唯一标识的 log entry 存储在本地的 log 中对应的下标
+func (rf *Raft) getLogEntryLocalIndex(index int32) int {
+	len := int(rf.getLogLen())
+	for i := 1; i <= len; i++ {
+		if rf.log[i].INDEX == index {
+			return i
+		}
+	}
+	// 未找到对应 index 的 log entry，返回 -1
+	return 0
 }
 
 func (rf *Raft) getLogLen() int32 {
-	return int32(len(rf.log) - 1)
+	return rf.log_entry_len
 }
 
 func (rf *Raft) appendLogEntry(prev_log_index int32, entries ...LogEntry) {
-	rf.log = append(rf.log[:prev_log_index+1], entries...)
+	log_len := int(rf.getLogLen())
+	for i := 0; i <= log_len; i++ {
+		if rf.log[i].INDEX == prev_log_index {
+			rf.log = append(rf.log[:i+1], entries...)
+			rf.log_entry_len = int32(i + len(entries))
+			return
+		}
+	}
 }
 
 func (rf *Raft) AddTerm(v int32) int32 {
