@@ -5,7 +5,7 @@ while true; do
     go test -run 2C -race > txt.log 2>&1
     
     # 检查输出中是否包含 FAIL
-    if grep -q "FAIL" txt.log; then
+    if grep -q "FAIL " txt.log; then
         echo "测试失败，停止执行"
         tail -1 txt.log  # 显示最后一行
         break  # 退出循环
