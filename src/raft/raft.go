@@ -423,19 +423,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.TERM = max(term, args.TERM)
 	reply.SEVER_ID = int32(rf.me)
 	reply.SUCCESS = false
-	if args.TERM < term || !rf.consitencyCheck(args) {
-		fmt.Printf("[%d] reject AppendEntries because of inconsitency\n", rf.me)
+	if args.TERM < term {
+		fmt.Printf("[%d] reject AppendEntries because of lower term, reply: %v\n", rf.me, reply)
 		return
 	}
-	reply.SUCCESS = true
 	if !rf.isFollower() {
 		fmt.Printf("[%d] become follower because of received higher term: %v\n", rf.me, args)
 		rf.toFollower()
-	}
-	if args.TERM > term {
 		rf.current_term = args.TERM
 		rf.resetVoteFor()
 	}
+	if !rf.consitencyCheck(args) {
+		fmt.Printf("[%d] reject AppendEntries because of inconsitency, reply: %v\n", rf.me, reply)
+		return
+	}
+	reply.SUCCESS = true
 	rf.leader_id = args.LEADER_ID
 	rf.setCommitIndex(args.LEADER_COMMIT)
 	rf.appendLogEntry(args.PREV_LOG_INDEX, args.ENTRIES...)
@@ -512,7 +514,7 @@ func (rf *Raft) consitencyCheck(args *AppendEntriesArgs) bool {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
-		fmt.Printf("[%d] sendRequestVote to %d failed\n", rf.me, server)
+		// fmt.Printf("[%d] sendRequestVote to %d failed\n", rf.me, server)
 	}
 	return ok
 }
@@ -520,7 +522,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
-		fmt.Printf("[%d] sendAppendEntries to %d failed, args: %v\n", rf.me, server, args)
+		// fmt.Printf("[%d] sendAppendEntries to %d failed, args: %v\n", rf.me, server, args)
 	}
 	return ok
 }
@@ -649,7 +651,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	// go rf.StatePrint()
+	go rf.StatePrint()
 	go rf.applyLog()
 
 	return rf
@@ -657,7 +659,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) applyLog() {
 	for !rf.killed() {
-		time.Sleep(10 * time.Millisecond)
+		if rf.getCommitIndex() == rf.getLastApplied() {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		if rf.getCommitIndex() > rf.getLastApplied() {
 			rf.Lock()
 			apply_log, ok := rf.getLogEntry(int32(rf.last_applied + 1))
@@ -667,13 +672,13 @@ func (rf *Raft) applyLog() {
 				continue
 			}
 			fmt.Printf("[%d] apply log: %v\n", rf.me, apply_log)
+			rf.Unlock()
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      apply_log.COMMAND,
 				CommandIndex: int(apply_log.INDEX),
 			}
 			rf.AddLastApplied(1)
-			rf.Unlock()
 		}
 	}
 }
@@ -684,10 +689,10 @@ func (rf *Raft) StatePrint() {
 		fmt_string := ""
 		if rf.isLeader() {
 			fmt_string += fmt.Sprintf("[%d] role: %v, term: %d, leader_id: %d, commit_index: %d, vote_for: %d, last_applied: %d, next_index: %v, match_index: %v, log: %v\n",
-				rf.me, int2Role(rf.getRole()), rf.current_term, rf.leader_id, rf.commit_index, rf.vote_for, rf.last_applied, rf.next_index, rf.match_index, rf.log)
+				rf.me, int2Role(rf.getRole()), rf.current_term, rf.leader_id, rf.commit_index, rf.vote_for, rf.getLastApplied(), rf.next_index, rf.match_index, rf.log)
 		} else {
 			fmt_string += fmt.Sprintf("[%d] role: %v, term: %d, leader_id: %d, commit_index: %d, vote_for: %d, last_applied: %d, log: %v\n",
-				rf.me, int2Role(rf.getRole()), rf.current_term, rf.leader_id, rf.commit_index, rf.vote_for, rf.last_applied, rf.log)
+				rf.me, int2Role(rf.getRole()), rf.current_term, rf.leader_id, rf.commit_index, rf.vote_for, rf.getLastApplied(), rf.log)
 		}
 		fmt.Printf("%s", fmt_string)
 		rf.Unlock()
@@ -745,8 +750,6 @@ func (rf *Raft) isReceivedHeartbeat() bool {
 }
 
 func (rf *Raft) leaderElection() {
-	fmt.Printf("[%d] start leader election\n", rf.me)
-	defer fmt.Printf("[%d] stop leader election\n", rf.me)
 	rf.Lock()
 	// 清空 stop_election_chan
 	select {
@@ -754,8 +757,10 @@ func (rf *Raft) leaderElection() {
 	default:
 	}
 	rf.current_term += 1
+	term := rf.current_term
 	rf.vote_for = int32(rf.me)
 	rf.persist()
+	fmt.Printf("[%d] start leader election, term: %d\n", rf.me, term)
 	last_log_entry := rf.getLastLogEntry()
 	args := &RequestVoteArgs{
 		TERM:           rf.current_term,
@@ -766,14 +771,16 @@ func (rf *Raft) leaderElection() {
 	reply_chan := make(chan RequestVoteReply)
 	all_servers := len(rf.peers)
 	majority := (all_servers + 1) / 2
-	vote_counts := 1
 
 	rf.Unlock()
+	var wg sync.WaitGroup
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
+		wg.Add(1)
 		go func(peer int) {
+			defer wg.Done()
 			reply := &RequestVoteReply{}
 			if ok := rf.sendRequestVote(peer, args, reply); ok {
 				reply_chan <- *reply
@@ -781,29 +788,46 @@ func (rf *Raft) leaderElection() {
 		}(peer)
 	}
 
-	for !rf.killed() && vote_counts < majority {
-		select {
-		case <-rf.stop_election_chan:
-			return
-		case reply := <-reply_chan:
-			rf.Lock()
-			fmt.Printf("[%d] received vote reply: %v\n", rf.me, reply)
-			if reply.VOTE_GRANTED {
-				vote_counts += 1
-			} else if reply.TERM > rf.current_term {
-				rf.setRole(RoleFollower)
-				rf.setIsReceivedHeartbeat()
-				rf.current_term = reply.TERM
-				rf.resetVoteFor()
-				rf.persist()
-				rf.Unlock()
-				return
-			}
+	go func() {
+		wg.Wait()
+		close(reply_chan)
+	}()
+
+	go rf.handle_request_vote(term, majority, reply_chan)
+}
+
+func (rf *Raft) handle_request_vote(term int32, majority int, request_chan chan RequestVoteReply) {
+	defer fmt.Printf("[%d] stop leader election, term: %d\n", rf.me, term)
+	vote_counts := 1
+	for reply := range request_chan {
+		rf.Lock()
+		fmt.Printf("[%d] received vote reply: %v\n", rf.me, reply)
+		// 过期消息，丢弃
+		if reply.TERM < rf.current_term {
 			rf.Unlock()
+			continue
+		}
+		if reply.VOTE_GRANTED {
+			vote_counts += 1
+		} else if reply.TERM > rf.current_term {
+			rf.setRole(RoleFollower)
+			rf.setIsReceivedHeartbeat()
+			rf.current_term = reply.TERM
+			rf.resetVoteFor()
+			rf.persist()
+			rf.Unlock()
+			return
+		}
+		rf.Unlock()
+
+		if vote_counts >= majority {
+			break
 		}
 	}
-	fmt.Printf("server %d now is leader\n", rf.me)
-	rf.toLeader()
+	if vote_counts >= majority {
+		fmt.Printf("server %d now is leader, term: %d\n", rf.me, term)
+		rf.toLeader()
+	}
 }
 
 func (rf *Raft) toLeader() {
@@ -867,11 +891,19 @@ func (rf *Raft) sendHeartbeats() {
 	fmt.Printf("[%d] start sendHeartbeats\n", rf.me)
 	defer fmt.Printf("[%d] stop sendHeartbeats\n", rf.me)
 	for !rf.killed() {
+		rf.Lock()
+		term := rf.current_term
+		rf.Unlock()
 		select {
 		case <-rf.stop_heartbeat_chan:
 			return
 		default:
 			rf.Lock()
+			// 如果当前 term 已经过期，那么就直接返回
+			if term < rf.current_term {
+				rf.Unlock()
+				return
+			}
 			all_servers := len(rf.peers)
 			args := make([]*AppendEntriesArgs, all_servers)
 			// 如果需要发送快照，那么就先不发送心跳
@@ -895,7 +927,7 @@ func (rf *Raft) sendHeartbeats() {
 					})
 				}
 				args[peer] = &AppendEntriesArgs{
-					TERM:           rf.current_term,
+					TERM:           term,
 					LEADER_ID:      int32(rf.me),
 					PREV_LOG_INDEX: prev_log_entry.INDEX,
 					PREV_LOG_TERM:  prev_log_entry.TERM,
@@ -905,7 +937,7 @@ func (rf *Raft) sendHeartbeats() {
 				// 为了防止同样的请求被响应多次，我们需要记录上一次发送的请求
 				// 如果上一次发送的请求和当前请求相同，那么就直接使用上一次的 session_id
 				current_args := PrevAppendEntriesArgs{
-					term:           rf.current_term,
+					term:           term,
 					prev_log_index: prev_log_entry.INDEX,
 					prev_log_term:  prev_log_entry.TERM,
 					leader_commit:  rf.getCommitIndex(),
@@ -947,8 +979,8 @@ func (rf *Raft) sendHeartbeats() {
 			go rf.handle_heartbeats(args, reply_ch)
 			go close_reply_ch()
 		}
-		// 70ms 后发送下一批心跳
-		time.Sleep(70 * time.Millisecond)
+		// 60ms 后发送下一批心跳
+		time.Sleep(60 * time.Millisecond)
 	}
 }
 
@@ -964,18 +996,17 @@ func (rf *Raft) handle_heartbeats(args []*AppendEntriesArgs, heartbeat_chan chan
 			rf.expect_index[server] = reply.SESSION_ID + 1
 			rf.Unlock()
 		}
+		rf.Lock()
 		fmt.Printf("[%d] received %d heartbeat reply: %v\n", rf.me, server, reply)
 		if reply.TERM > rf.current_term {
-			// 先更新 role 到 follower 再更新 term，确保 同一个 term 不出现两个 leader 的情况
-			// persist 需要 Lock
-			rf.Lock()
 			rf.toFollower()
 			rf.current_term = reply.TERM
 			rf.resetVoteFor()
 			rf.persist()
 			rf.Unlock()
-			return
+			continue
 		}
+		rf.Unlock()
 		if reply.SUCCESS {
 			if len(args[server].ENTRIES) > 0 {
 				rf.Lock()
@@ -1069,8 +1100,8 @@ func (rf *Raft) sendSnapshotIfNeeded() {
 				select {
 				case reply := <-reply_ch:
 					need_wait -= 1
+					rf.Lock()
 					if reply.TERM > rf.current_term {
-						rf.Lock()
 						rf.toFollower()
 						rf.current_term = reply.TERM
 						rf.resetVoteFor()
@@ -1078,7 +1109,6 @@ func (rf *Raft) sendSnapshotIfNeeded() {
 						rf.Unlock()
 						return
 					}
-					rf.Lock()
 					server := reply.SERVER_ID
 					rf.match_index[server] = args[server].LAST_INCLUDED_INDEX
 					rf.next_index[server] = args[server].LAST_INCLUDED_INDEX + 1
