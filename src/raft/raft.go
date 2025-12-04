@@ -212,6 +212,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.log_entry_len = log_entry_len
 		rf.last_included_index = last_included_index
 		rf.last_included_term = last_included_term
+		rf.last_applied = last_included_index
+		rf.commit_index = last_included_index
 		rf.snapshot = snapshot
 	}
 }
@@ -221,21 +223,29 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	// Your code here (2D).
 	rf.setIsReceivedHeartbeat()
-	var command interface{}
+	var command int
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&command) != nil {
-		fmt.Printf("CondInstallSnapshot: decode command error: %v\n", d)
+	if err := d.Decode(&command); err != nil {
+		fmt.Printf("CondInstallSnapshot: decode command error: %v\n", err)
 	} else {
 		fmt.Printf("[%d] CondInstallSnapshot: lastIncludedTerm %d, lastIncludedIndex %d, snapshot %v\n", rf.me, lastIncludedTerm, lastIncludedIndex, command)
 		rf.Lock()
 		defer rf.Unlock()
-		rf.discard_old_log(int32(lastIncludedIndex), int32(lastIncludedTerm), command)
-		rf.last_applied = int32(lastIncludedIndex)
-		rf.persist()
+		rf.discard_old_log(int32(lastIncludedIndex), int32(lastIncludedTerm))
 		rf.snapshot = snapshot
 		rf.last_included_index = int32(lastIncludedIndex)
 		rf.last_included_term = int32(lastIncludedTerm)
+		if rf.getCommitIndex() < int32(lastIncludedIndex) {
+			rf.setCommitIndex(int32(lastIncludedIndex))
+		}
+		if rf.getLastApplied() < int32(lastIncludedIndex) {
+			rf.SetLastApplied(int32(lastIncludedIndex))
+		}
+		if rf.current_term < int32(lastIncludedTerm) {
+			rf.current_term = int32(lastIncludedTerm)
+		}
+		rf.persist()
 	}
 	return true
 }
@@ -256,35 +266,34 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		fmt.Printf("Snapshot: decode command error: %v\n", d)
 	} else {
 		// 利用 snapshot 重新构建 log
-		rf.discard_old_log(int32(index), rf.current_term, command)
+		rf.discard_old_log(int32(index), rf.current_term)
 		// index 是最新的 last_applied，此处需要更新
 		rf.snapshot = snapshot
 		rf.last_included_index = int32(index)
 		rf.last_included_term = int32(rf.current_term)
+		if rf.getCommitIndex() < int32(index) {
+			rf.setCommitIndex(int32(index))
+		}
 		fmt.Printf("[%d] after snapshot: log_len: %d, log: %v\n", rf.me, rf.log_entry_len, rf.log)
 		rf.persist()
 
 	}
 }
 
-func (rf *Raft) discard_old_log(last_included_index int32, last_included_term int32, cmd interface{}) {
+func (rf *Raft) discard_old_log(last_included_index int32, last_included_term int32) {
 	for i := rf.getLogLen(); i >= 1; i-- {
 		if rf.log[i].INDEX == int32(last_included_index) &&
 			rf.log[i].TERM == int32(last_included_term) {
 			new_log := make([]LogEntry, 1)
-			new_log = append(new_log, rf.log[i:]...)
+			new_log = append(new_log, rf.log[i+1:]...)
 			rf.log = new_log
-			rf.log_entry_len -= i - 1
+			rf.log_entry_len -= i
 			return
 		}
 	}
 	// 这种情况在 follower 没有完成任何 log entry 的复制时，会出现
 	rf.log = make([]LogEntry, 1)
-	rf.log = append(rf.log, LogEntry{
-		INDEX:   last_included_index,
-		TERM:    last_included_term,
-		COMMAND: cmd,
-	})
+	rf.log_entry_len = 0
 }
 
 // example RequestVote RPC arguments structure.
@@ -430,9 +439,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if !rf.isFollower() {
 		fmt.Printf("[%d] become follower because of received higher term: %v\n", rf.me, args)
 		rf.toFollower()
-		rf.current_term = args.TERM
 		rf.resetVoteFor()
 	}
+	rf.current_term = args.TERM
 	if !rf.consitencyCheck(args) {
 		fmt.Printf("[%d] reject AppendEntries because of inconsitency, reply: %v\n", rf.me, reply)
 		return
@@ -460,13 +469,27 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.Lock()
-	defer rf.Unlock()
-	reply.TERM = rf.current_term
+	fmt.Printf("[%d] InstallSnapshot: %v\n", rf.me, args)
+	reply.TERM = max(rf.current_term, args.TERM)
 	reply.SERVER_ID = int32(rf.me)
 	if rf.current_term > args.TERM {
+		rf.Unlock()
+		return
+	}
+	if rf.current_term < args.TERM {
+		if !rf.isFollower() {
+			rf.toFollower()
+		}
+		rf.current_term = args.TERM
+		rf.resetVoteFor()
+		rf.persist()
+	}
+	if rf.getLastApplied() > args.LAST_INCLUDED_INDEX {
+		rf.Unlock()
 		return
 	}
 	rf.leader_id = args.LEADER_ID
+	rf.Unlock()
 	apply_snap := ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.DATA,
@@ -478,7 +501,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 func (rf *Raft) consitencyCheck(args *AppendEntriesArgs) bool {
 	prev_log_entry, ok := rf.getLogEntry(args.PREV_LOG_INDEX)
-	if !ok || args.PREV_LOG_TERM != prev_log_entry.TERM || args.PREV_LOG_INDEX != prev_log_entry.INDEX {
+	if ok && (args.PREV_LOG_TERM != prev_log_entry.TERM || args.PREV_LOG_INDEX != prev_log_entry.INDEX) {
+		return false
+	}
+	if !ok && (rf.last_included_index != args.PREV_LOG_INDEX || rf.last_included_term != args.PREV_LOG_TERM) {
 		return false
 	}
 	return true
@@ -520,10 +546,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	fmt.Printf("[%d] sendAppendEntries to %d\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if !ok {
-		// fmt.Printf("[%d] sendAppendEntries to %d failed, args: %v\n", rf.me, server, args)
-	}
 	return ok
 }
 
@@ -544,7 +568,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.Lock()
 	defer rf.Unlock()
 	term, isLeader := rf.current_term, rf.isLeader()
-	last_log_entry_index := int(rf.getLastLogEntry().INDEX)
+	last_log_entry_index := 0
+	if rf.getLogLen() == 0 {
+		last_log_entry_index = int(rf.last_included_index)
+	} else {
+		last_log_entry_index = int(rf.getLastLogEntry().INDEX)
+	}
 	if !isLeader {
 		return last_log_entry_index + 1, int(term), isLeader
 	}
@@ -659,11 +688,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) applyLog() {
 	for !rf.killed() {
-		if rf.getCommitIndex() == rf.getLastApplied() {
+		rf.Lock()
+		prev_log_entry := rf.getLastLogEntry()
+		rf.Unlock()
+		if rf.getCommitIndex() == rf.getLastApplied() ||
+			prev_log_entry.INDEX == rf.getLastApplied() {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		if rf.getCommitIndex() > rf.getLastApplied() {
+		if rf.getCommitIndex() > rf.getLastApplied() &&
+			prev_log_entry.INDEX > rf.getLastApplied() {
 			rf.Lock()
 			apply_log, ok := rf.getLogEntry(int32(rf.last_applied + 1))
 			if !ok {
@@ -671,13 +705,13 @@ func (rf *Raft) applyLog() {
 				fmt.Printf("panic [%d] apply log: log entry not found, index: %d\n", rf.me, rf.last_applied+1)
 				continue
 			}
-			fmt.Printf("[%d] apply log: %v\n", rf.me, apply_log)
 			rf.Unlock()
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      apply_log.COMMAND,
 				CommandIndex: int(apply_log.INDEX),
 			}
+			fmt.Printf("[%d] apply log: %v\n", rf.me, apply_log)
 			rf.AddLastApplied(1)
 		}
 	}
@@ -688,11 +722,11 @@ func (rf *Raft) StatePrint() {
 		rf.Lock()
 		fmt_string := ""
 		if rf.isLeader() {
-			fmt_string += fmt.Sprintf("[%d] role: %v, term: %d, leader_id: %d, commit_index: %d, vote_for: %d, last_applied: %d, next_index: %v, match_index: %v, log: %v\n",
-				rf.me, int2Role(rf.getRole()), rf.current_term, rf.leader_id, rf.commit_index, rf.vote_for, rf.getLastApplied(), rf.next_index, rf.match_index, rf.log)
+			fmt_string += fmt.Sprintf("[%d] role: %v, term: %d, leader_id: %d, commit_index: %d, vote_for: %d, last_applied: %d, next_index: %v, match_index: %v, last_included_index: %d, last_included_term: %d, log: %v\n",
+				rf.me, int2Role(rf.getRole()), rf.current_term, rf.leader_id, rf.commit_index, rf.vote_for, rf.getLastApplied(), rf.next_index, rf.match_index, rf.last_included_index, rf.last_included_term, rf.log)
 		} else {
-			fmt_string += fmt.Sprintf("[%d] role: %v, term: %d, leader_id: %d, commit_index: %d, vote_for: %d, last_applied: %d, log: %v\n",
-				rf.me, int2Role(rf.getRole()), rf.current_term, rf.leader_id, rf.commit_index, rf.vote_for, rf.getLastApplied(), rf.log)
+			fmt_string += fmt.Sprintf("[%d] role: %v, term: %d, leader_id: %d, commit_index: %d, vote_for: %d, last_applied: %d, last_included_index: %d, last_included_term: %d, log: %v\n",
+				rf.me, int2Role(rf.getRole()), rf.current_term, rf.leader_id, rf.commit_index, rf.vote_for, rf.getLastApplied(), rf.last_included_index, rf.last_included_term, rf.log)
 		}
 		fmt.Printf("%s", fmt_string)
 		rf.Unlock()
@@ -1016,25 +1050,22 @@ func (rf *Raft) handle_heartbeats(args []*AppendEntriesArgs, heartbeat_chan chan
 			}
 		} else {
 			rf.Lock()
-			need_snapshot := true
 			var prev_log_entry *LogEntry = nil
 			for rf.next_index[server] > 1 {
 				log_entry, ok := rf.getLogEntry(rf.next_index[server] - 1)
 				if !ok {
-					need_snapshot = true
+					if rf.next_index[server] > rf.last_included_index+1 {
+						// 回退到 snapshot 的日志，如果还是匹配不成功那么需要重新推送 snapshot
+						rf.next_index[server] = rf.last_included_index + 1
+					}
 					break
 				} else if prev_log_entry == nil || log_entry.TERM == prev_log_entry.TERM {
-					need_snapshot = false
 					rf.next_index[server] -= 1
 					prev_log_entry = &log_entry
 				} else {
 					break
 				}
 
-			}
-			rf.need_snapshot[server] = need_snapshot
-			if need_snapshot {
-				fmt.Printf("[%d] %d need snapshot, reply: %v\n", rf.me, server, reply)
 			}
 			rf.Unlock()
 		}
@@ -1050,6 +1081,9 @@ func (rf *Raft) sendSnapshotIfNeeded() {
 	fmt.Printf("[%d] start sendSnapshotIfNeeded\n", rf.me)
 	defer fmt.Printf("[%d] stop sendSnapshotIfNeeded\n", rf.me)
 	for !rf.killed() {
+		rf.Lock()
+		term := rf.current_term
+		rf.Unlock()
 		select {
 		case <-rf.stop_snapshot_chan:
 			return
@@ -1059,15 +1093,14 @@ func (rf *Raft) sendSnapshotIfNeeded() {
 			reply_ch := make(chan InstallSnapshotReply, all_server-1)
 			var wg sync.WaitGroup
 			args := make([]*InstallSnapshotArgs, all_server)
-			need_wait := 0
 			for peer := 0; peer < all_server; peer++ {
 				if peer == rf.me {
 					continue
 				}
 				if rf.need_snapshot[peer] {
-					need_wait += 1
+					fmt.Printf("[%d] %d need snapshot\n", rf.me, peer)
 					args[peer] = &InstallSnapshotArgs{
-						TERM:                rf.current_term,
+						TERM:                term,
 						LEADER_ID:           int32(rf.me),
 						LAST_INCLUDED_INDEX: rf.last_included_index,
 						LAST_INCLUDED_TERM:  rf.last_included_term,
@@ -1084,44 +1117,45 @@ func (rf *Raft) sendSnapshotIfNeeded() {
 			}
 			rf.Unlock()
 
+			go rf.handle_snapshot(args, reply_ch)
+
 			go func() {
 				wg.Wait()
 				close(reply_ch)
 			}()
-
-			stop_sign := int32(0)
-			go func() {
-				time.Sleep(40 * time.Millisecond)
-				atomic.StoreInt32(&stop_sign, 1)
-			}()
-
-			for atomic.LoadInt32(&stop_sign) == 0 && need_wait > 0 {
-				time.Sleep(5 * time.Millisecond)
-				select {
-				case reply := <-reply_ch:
-					need_wait -= 1
-					rf.Lock()
-					if reply.TERM > rf.current_term {
-						rf.toFollower()
-						rf.current_term = reply.TERM
-						rf.resetVoteFor()
-						rf.persist()
-						rf.Unlock()
-						return
-					}
-					server := reply.SERVER_ID
-					rf.match_index[server] = args[server].LAST_INCLUDED_INDEX
-					rf.next_index[server] = args[server].LAST_INCLUDED_INDEX + 1
-					rf.need_snapshot[server] = false
-					rf.Unlock()
-				default:
-				}
-			}
 		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) handle_snapshot(args []*InstallSnapshotArgs, reply_chan chan InstallSnapshotReply) {
+	for reply := range reply_chan {
+		fmt.Printf("[%d] received %d snapshot reply: %v\n", rf.me, reply.SERVER_ID, reply)
+		rf.Lock()
+		// 过期的回复，直接忽略
+		if reply.TERM < rf.current_term {
+			rf.Unlock()
+			return
+		}
+		if reply.TERM > rf.current_term {
+			rf.toFollower()
+			rf.current_term = reply.TERM
+			rf.resetVoteFor()
+			rf.persist()
+			rf.Unlock()
+			return
+		}
+		server := reply.SERVER_ID
+		rf.match_index[server] = args[server].LAST_INCLUDED_INDEX
+		rf.next_index[server] = args[server].LAST_INCLUDED_INDEX + 1
+		rf.need_snapshot[server] = false
+		fmt.Printf("[%d] %d snapshot install success\n", rf.me, server)
+		rf.Unlock()
 	}
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	fmt.Printf("[%d] sendInstallSnapshot to %d\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	if !ok {
 		fmt.Printf("[%d] sendInstallSnapshot to %d failed\n", rf.me, server)
@@ -1130,6 +1164,15 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 }
 
 func (rf *Raft) getLastLogEntry() LogEntry {
+	if rf.getLogLen() == 0 {
+		return LogEntry{
+			INDEX: rf.last_included_index,
+			TERM:  rf.last_included_term,
+		}
+	}
+	if int(rf.getLogLen()) >= len(rf.log) {
+		panic(fmt.Sprintf("[%d] log_len: %d, log_entry: %v\n", rf.me, rf.getLogLen(), rf.log))
+	}
 	return rf.log[int(rf.getLogLen())]
 }
 
@@ -1142,6 +1185,12 @@ func (rf *Raft) getLogEntry(index int32) (LogEntry, bool) {
 		if rf.log[i].INDEX == index {
 			return rf.log[i], true
 		}
+	}
+	if rf.last_included_index == index {
+		return LogEntry{
+			INDEX: rf.last_included_index,
+			TERM:  rf.last_included_term,
+		}, true
 	}
 	// 未找到对应 index 的 log entry，返回空 log entry
 	return LogEntry{}, false
@@ -1172,6 +1221,11 @@ func (rf *Raft) appendLogEntry(prev_log_index int32, entries ...LogEntry) {
 			return
 		}
 	}
+	if prev_log_index == rf.last_included_index {
+		rf.log = append(rf.log[:1], entries...)
+		rf.log_entry_len = int32(len(entries))
+		return
+	}
 }
 
 func (rf *Raft) resetVoteFor() {
@@ -1192,6 +1246,10 @@ func (rf *Raft) getLastApplied() int32 {
 
 func (rf *Raft) AddLastApplied(x int32) {
 	atomic.AddInt32(&rf.last_applied, x)
+}
+
+func (rf *Raft) SetLastApplied(last_applied int32) {
+	atomic.StoreInt32(&rf.last_applied, last_applied)
 }
 
 func max(a, b int32) int32 {
